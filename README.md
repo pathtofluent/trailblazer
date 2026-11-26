@@ -38,6 +38,7 @@ If you made cards with an earlier Trailblazer, don't re-import them. In Anki, us
 | [Waypoint](https://github.com/pathtofluent/waypoint) | Sorts sentence cards so the next one has exactly one unknown word |
 | [Checkpoint](https://github.com/pathtofluent/checkpoint) | A single Complete button for chapter and lesson cards |
 | [Scout](https://github.com/pathtofluent/scout) | Finds Netflix titles by country and original language |
+| [Logbook](https://github.com/pathtofluent/logbook) | Logs your time with a language and tracks hours, known words and milestones |
 
 ## Licence
 
