@@ -26,7 +26,9 @@ Importing the same episode again updates its cards instead of duplicating them.
 
 ## Cards
 
-The note type is `PathToFluent Trailblazer`, with fields Sequence, Sentence, Translation, Audio, Snapshot, Source, Notes, Unknown Words and Labels. The last two are filled in by Waypoint.
+The note type is `PathToFluent Trailblazer`. Trailblazer fills Sequence, Sentence, Translation, Audio, Snapshot and Source; Notes is yours. The rest are filled in by Waypoint: Unknown Words, Labels, Lemma, Definition, Definition Monolingual and Dictionary Link. The back of the card shows the new word and its definition once Waypoint has supplied them.
+
+If you made cards with an earlier Trailblazer, don't re-import them. In Anki, use Tools > PathToFluent Waypoint > Prepare a note type, which adds the new fields and layout to the cards you already have.
 
 ## The PathToFluent tools
 

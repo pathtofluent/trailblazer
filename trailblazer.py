@@ -16,7 +16,7 @@ import unicodedata, webbrowser, zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-APP, VERSION = "PathToFluent Trailblazer", "1.3.0"
+APP, VERSION = "PathToFluent Trailblazer", "1.4.0"
 TOKEN = secrets.token_urlsafe(16)
 MEDIA_EXT = {".mkv", ".mp4", ".m4v", ".avi", ".mov", ".webm", ".ts", ".flv", ".wmv", ".mpg",
              ".mpeg", ".mp3", ".m4a", ".m4b", ".aac", ".flac", ".ogg", ".opus", ".wav"}
@@ -230,26 +230,39 @@ text-align:center;color:#1c1c1e;background:#fafafa;margin:0;padding:16px}
 .sd img{max-width:100%;max-height:45vh;border-radius:10px}
 .sentence{font-size:1.25em;line-height:1.4;margin:18px 6px}
 .trbtn{font-size:.7em;padding:8px 18px;border-radius:999px;border:1px solid #8884;background:transparent;
-color:inherit;cursor:pointer}
+color:inherit;cursor:pointer;margin:4px}
 .tr{display:none;margin:14px 6px;font-size:.9em;opacity:.8}
-.new{font-size:.75em;margin:0 6px 14px;color:#2f6f5e;font-weight:600}
+.new{font-size:.75em;margin:0 6px 10px;color:#2f6f5e;font-weight:600}
+.lemma{font-weight:400;opacity:.75}
+.def{margin:8px 10px 12px;font-size:.85em;line-height:1.45}
+.wp .def.mono,.wp .enbtn{display:none}
+.wp[data-tags~="waypoint_monolingual"] .def.mono{display:block}
+.wp[data-tags~="waypoint_monolingual"] .def.bi{display:none}
+.wp[data-tags~="waypoint_monolingual"] .enbtn{display:inline-block}
+.dict{font-size:.6em;margin:4px 0 12px}.dict a{color:inherit;opacity:.6}
 .notes{font-size:.8em;margin-top:10px}.src{font-size:.5em;opacity:.45;margin-top:18px}"""
 CARD_FRONT = """<div class="sd">
 {{#Snapshot}}<div class="img">{{Snapshot}}</div>{{/Snapshot}}
 <div class="audio">{{Audio}}</div>
 {{^Audio}}{{^Snapshot}}<div class="sentence">{{Sentence}}</div>{{/Snapshot}}{{/Audio}}
 </div>"""
-CARD_BACK = """<div class="sd">
+CARD_BACK = """<div class="sd wp" data-tags="{{Tags}}">
 {{#Snapshot}}<div class="img">{{Snapshot}}</div>{{/Snapshot}}
 <div class="audio">{{Audio}}</div>
 <div class="sentence">{{Sentence}}</div>
-{{#Unknown Words}}<div class="new">New: {{Unknown Words}}</div>{{/Unknown Words}}
+{{#Unknown Words}}<div class="new">New: {{Unknown Words}}{{#Lemma}} <span class="lemma">({{Lemma}})</span>{{/Lemma}}</div>
+{{#Definition Monolingual}}<div class="def mono">{{Definition Monolingual}}</div>{{/Definition Monolingual}}
+{{#Definition}}<div class="def bi">{{Definition}}</div>
+<button class="trbtn enbtn" onclick="var d=this.previousElementSibling,s=d.style.display==='block';d.style.display=s?'none':'block';this.textContent=s?'Show English':'Hide English';">Show English</button>{{/Definition}}
+{{#Dictionary Link}}<div class="dict">{{Dictionary Link}}</div>{{/Dictionary Link}}{{/Unknown Words}}
 {{#Translation}}<button class="trbtn" onclick="var t=this.nextElementSibling,s=t.style.display==='block';t.style.display=s?'none':'block';this.textContent=s?'Show translation':'Hide translation';">Show translation</button>
 <div class="tr">{{Translation}}</div>{{/Translation}}
 {{#Notes}}<div class="notes">{{Notes}}</div>{{/Notes}}
 <div class="src">{{Source}}</div>
 </div>"""
-FIELDS = ["Sequence", "Sentence", "Translation", "Audio", "Snapshot", "Source", "Notes", "Unknown Words", "Labels"]
+# Keep the layout and fields in step with PathToFluent Waypoint (its addon/layout.py).
+FIELDS = ["Sequence", "Sentence", "Translation", "Audio", "Snapshot", "Source", "Notes",
+          "Unknown Words", "Labels", "Lemma", "Definition", "Definition Monolingual", "Dictionary Link"]
 SCHEMA = """
 CREATE TABLE col (id integer primary key, crt integer not null, mod integer not null, scm integer not null,
  ver integer not null, dty integer not null, usn integer not null, ls integer not null, conf text not null,
@@ -418,7 +431,7 @@ def generate(req):
                                      "[sound:%s]" % res["audio"] if res["audio"] else "",
                                      '<img src="%s">' % res["shot"] if res["shot"] else "",
                                      html.escape("%s · %s" % (episode, res["seq"].rsplit(".", 1)[0].replace(".", ":"))),
-                                     "", "", ""]})
+                                     ""] + [""] * 6})
         outdir = os.path.expanduser(req.get("outdir") or pr["folder"])
         if not (os.path.isdir(outdir) and os.access(outdir, os.W_OK)):
             outdir = os.path.join(os.path.expanduser("~"), "Downloads")
