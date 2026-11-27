@@ -17,8 +17,10 @@ Needs Python 3.8 or newer and ffmpeg (`brew install ffmpeg` on macOS, `winget in
 ## Use it
 
 1. **Choose files.** Pick an episode or film, then the subtitles in the language you're learning and, optionally, a translation track. Subtitle files next to the video and text tracks inside it are found for you.
-2. **Review.** Press play on any line to hear the clip and see the snapshot. Untick lines you don't want; click text to edit it.
+2. **Review.** Press play on any line to hear the clip and see the snapshot. Untick lines you don't want; click text to edit it. Set the extra audio before and after each line here and listen with play; a negative number trims the clip.
 3. **Create the deck.** You get one `.apkg` file. Double-click it and Anki imports the cards, audio and images.
+
+Speaker and sound captions such as [door slams] or (MUJER) are removed from the cards unless you turn that option off.
 
 Reads .srt, .vtt and .ass subtitles. Image-based subtitles (most DVD and Blu-ray tracks) can't be read. One episode at a time.
 

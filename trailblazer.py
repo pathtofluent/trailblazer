@@ -16,7 +16,7 @@ import unicodedata, webbrowser, zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-APP, VERSION = "PathToFluent Trailblazer", "1.4.0"
+APP, VERSION = "PathToFluent Trailblazer", "1.4.2"
 TOKEN = secrets.token_urlsafe(16)
 MEDIA_EXT = {".mkv", ".mp4", ".m4v", ".avi", ".mov", ".webm", ".ts", ".flv", ".wmv", ".mpg",
              ".mpeg", ".mp3", ".m4a", ".m4b", ".aac", ".flac", ".ogg", ".opus", ".wav"}
@@ -175,6 +175,9 @@ def clean_text(t, strip_sfx):
         t = re.sub(r"[♪♫]", "", t)
         if re.fullmatch(r"\s*[-–]?\s*\([^)]*\)\s*", t):
             t = ""
+        # (MUJER), (SOLLOZANDO): a caption inside a spoken line. Letters, none of them lower-case.
+        t = re.sub(r"\([^()]*\)", lambda m: "" if any(c.isalpha() for c in m.group())
+                   and not any(c.islower() for c in m.group()) else m.group(), t)
     t = re.sub(r"\s+", " ", t).strip()
     return "" if re.fullmatch(r"[-–\s]*", t) else t
 
@@ -356,6 +359,13 @@ def stamp(ms):
     return "%d.%02d.%02d.%03d" % (h, m, rem // 1000, rem % 1000)
 
 
+def clip_span(start_ms, end_ms, pad_before, pad_after):
+    """Where a line's audio clip starts and ends. Padding may be negative, which trims the clip;
+    trimming that would leave under a fifth of a second falls back to the subtitle's own times."""
+    st, en = max(0, start_ms - pad_before), end_ms + pad_after
+    return (st, en) if en - st >= 200 else (max(0, start_ms), end_ms)
+
+
 def clip_cmd(video, start_ms, end_ms, track, bitrate, out):
     return [FFMPEG, "-hide_banner", "-loglevel", "error", "-y", "-ss", "%.3f" % (start_ms / 1000),
             "-t", "%.3f" % ((end_ms - start_ms) / 1000), "-i", video, "-vn", "-sn", "-map", "0:a:%d" % track,
@@ -382,7 +392,7 @@ def generate(req):
         slug = slugify(deck + "_" + episode, episode)
         want_audio = bool(req.get("audio", True)) and bool(pr["audio"])
         want_shot = bool(req.get("snapshot", True)) and pr["has_video"]
-        pad_b, pad_a = int(req.get("pad_before", 250)), int(req.get("pad_after", 250))
+        pad_b, pad_a = int(req.get("pad_before", 0)), int(req.get("pad_after", 400))
         width, bitrate = int(req.get("width", 480)), int(req.get("bitrate", 96))
         track, lines = int(req.get("track", 0)), req["lines"]
         dur_ms = pr["duration"] * 1000 if pr["duration"] else None
@@ -395,7 +405,7 @@ def generate(req):
             base = "trailblazer_%s_%s" % (slug, seq)
             audio = shot = ""
             if want_audio:
-                st, en = max(0, ln["start"] - pad_b), ln["end"] + pad_a
+                st, en = clip_span(ln["start"], ln["end"], pad_b, pad_a)
                 if dur_ms:
                     en = min(en, dur_ms)
                 name = base + ".mp3"
@@ -644,12 +654,13 @@ macOS: install Homebrew from brew.sh, then run <code>brew install ffmpeg</code> 
 <details><summary>Timing and clean-up options</summary>
 <div class="row"><label>Shift subtitles by</label><input type="number" id="shift" value="0" step="50"> ms <span class="hint" style="margin:0">(positive = later; use if the text is out of sync with the speech)</span></div>
 <div class="row"><label>Shift translation by</label><input type="number" id="tshift" value="0" step="50"> ms</div>
-<div class="row"><label></label><input type="checkbox" id="sfx" checked><span>Drop sound-effect and music captions like [door slams] or ♪</span></div></details>
+<div class="row"><label></label><input type="checkbox" id="sfx" checked><span>Drop sound-effect, speaker and music captions like [door slams], (MUJER) or ♪</span></div></details>
 <div class="row"><button class="primary" id="load" disabled>Load subtitle lines</button><span id="loadmsg" class="hint" style="margin:0"></span></div>
 <div class="err" id="err1"></div></section>
 
 <section id="s2" class="hide"><h2><b>2</b>Review the lines</h2><p class="hint">Untick anything you don't want as a card. Press ▶ to hear a line and see its snapshot. Click any text to edit it.</p>
 <div class="bar"><button id="all">Select all</button><button id="none">Select none</button><input type="text" id="filter" placeholder="Filter lines…" style="max-width:240px"><span class="count" id="count"></span></div>
+<div class="row"><label>Extra audio before / after</label><input type="number" id="padb" value="0" step="50"> / <input type="number" id="pada" value="400" step="50"> ms <span class="hint" style="margin:0">▶ uses these, and so does the deck. A negative number trims: try -200 before if you hear the end of the previous line.</span></div>
 <div class="review"><div class="tablewrap"><table><thead><tr><th></th><th></th><th>Time</th><th>Sentence</th><th id="thtr">Translation</th></tr></thead><tbody id="rows"></tbody></table></div>
 <div class="side"><img id="shot" alt=""><p id="sidetxt">Press ▶ on a line to preview it.</p></div></div></section>
 
@@ -659,7 +670,6 @@ macOS: install Homebrew from brew.sh, then run <code>brew install ffmpeg</code> 
 <div class="row"><label>Save to folder</label><input type="text" id="outdir" spellcheck="false"><button id="bout">Browse…</button></div>
 <div class="row"><label>Include</label><input type="checkbox" id="waudio" checked><span>Audio clip</span>&nbsp;&nbsp;<input type="checkbox" id="wshot" checked><span>Snapshot</span></div>
 <details><summary>Audio and image options</summary>
-<div class="row"><label>Extra audio before / after</label><input type="number" id="padb" value="250" min="0" step="50"> / <input type="number" id="pada" value="250" min="0" step="50"> ms</div>
 <div class="row"><label>Audio quality</label><select id="bitrate" style="flex:0"><option value="64">Small (64 kbps)</option><option value="96" selected>Normal (96 kbps)</option><option value="128">High (128 kbps)</option></select></div>
 <div class="row"><label>Snapshot width</label><input type="number" id="width" value="480" min="160" max="1920" step="40"> px</div></details>
 <div class="row"><button class="primary" id="go">Create deck</button><button id="cancel" class="hide">Cancel</button></div>
@@ -732,8 +742,8 @@ $("#rows").addEventListener("click",e=>{const tr=e.target.closest("tr");if(!tr)r
   if(e.target.type=="checkbox"){const on=e.target.checked;let a=i,b=i;if(e.shiftKey&&S.last>=0){a=Math.min(i,S.last);b=Math.max(i,S.last)}
     document.querySelectorAll("#rows tr").forEach(r=>{const k=+r.dataset.i;if(k>=a&&k<=b){S.lines[k].on=on;r.className=on?"":"off";r.querySelector("input").checked=on}});S.last=i;count()}
   else if(e.target.classList.contains("play")){document.querySelectorAll("#rows tr.cur").forEach(r=>r.classList.remove("cur"));tr.classList.add("cur");
-    const pb=+$("#padb").value||0,pa=+$("#pada").value||0;if(player)player.pause();
-    if(S.probe.audio.length){player=new Audio(`/api/preview/audio?start=${Math.max(0,l.start-pb)}&end=${l.end+pa}&track=${$("#track").value||0}&t=${T}`);player.play().catch(()=>{})}
+    const pb=+$("#padb").value||0,pa=+$("#pada").value||0;let a0=Math.max(0,l.start-pb),a1=l.end+pa;if(a1-a0<200){a0=Math.max(0,l.start);a1=l.end}if(player)player.pause();
+    if(S.probe.audio.length){player=new Audio(`/api/preview/audio?start=${a0}&end=${a1}&track=${$("#track").value||0}&t=${T}`);player.play().catch(()=>{})}
     if(S.probe.has_video)$("#shot").src=`/api/preview/image?ms=${Math.round((l.start+l.end)/2)}&t=${T}`;$("#sidetxt").textContent=l.text}});
 $("#rows").addEventListener("input",e=>{const tr=e.target.closest("tr");if(!tr)return;const l=S.lines[+tr.dataset.i],v=e.target.textContent.replace(/\s+/g," ").trim();
   if(e.target.classList.contains("tx"))l.text=v;else if(e.target.classList.contains("tr2"))l.trans=v});
