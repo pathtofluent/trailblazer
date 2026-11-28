@@ -16,7 +16,7 @@ import unicodedata, webbrowser, zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-APP, VERSION = "PathToFluent Trailblazer", "1.4.2"
+APP, VERSION = "PathToFluent Trailblazer", "1.5.0"
 TOKEN = secrets.token_urlsafe(16)
 MEDIA_EXT = {".mkv", ".mp4", ".m4v", ".avi", ".mov", ".webm", ".ts", ".flv", ".wmv", ".mpg",
              ".mpeg", ".mp3", ".m4a", ".m4b", ".aac", ".flac", ".ogg", ".opus", ".wav"}
@@ -170,9 +170,9 @@ def clean_text(t, strip_sfx):
     t = re.sub(r"<[^>]+>", "", t)
     t = html.unescape(t)
     if strip_sfx:
+        if re.search(r"[♪♫]", t):                          # a sung line: the whole cue goes, words and all
+            return ""
         t = re.sub(r"\[[^\]]*\]", "", t)
-        t = re.sub(r"[♪♫][^♪♫]*[♪♫]", "", t)
-        t = re.sub(r"[♪♫]", "", t)
         if re.fullmatch(r"\s*[-–]?\s*\([^)]*\)\s*", t):
             t = ""
         # (MUJER), (SOLLOZANDO): a caption inside a spoken line. Letters, none of them lower-case.
@@ -194,6 +194,32 @@ def tidy(cues, shift, strip_sfx):
             out[-1]["end"] = max(out[-1]["end"], en)      # repeated cue, merge
         else:
             out.append({"start": st, "end": en, "text": text})
+    return out
+
+
+JOIN_GAP_MS, JOIN_MAX_MS, JOIN_MAX_CUES = 1000, 12000, 3
+
+
+def join_split(cues):
+    """Put back together a sentence the subtitles cut across two or three cues.
+    A cue is joined to the one before it only when the earlier one stops without closing punctuation
+    (it ends in a letter, a digit or a comma), this one starts with a lower-case letter, the pause
+    between them is short, and the result stays a reasonable length. Lines of dialogue starting
+    with a dash are left alone."""
+    out = []
+    for c in cues:
+        prev = out[-1] if out else None
+        if prev and prev.get("parts", 1) < JOIN_MAX_CUES and c["start"] - prev["end"] <= JOIN_GAP_MS \
+                and c["end"] - prev["start"] <= JOIN_MAX_MS \
+                and (prev["text"][-1].isalnum() or prev["text"][-1] == ",") \
+                and c["text"][0].islower() and "-" not in (prev["text"][0], c["text"][0]) \
+                and "–" not in (prev["text"][0], c["text"][0]):
+            prev["text"], prev["end"] = prev["text"] + " " + c["text"], max(prev["end"], c["end"])
+            prev["parts"] = prev.get("parts", 1) + 1
+        else:
+            out.append(dict(c))
+    for c in out:
+        c.pop("parts", None)
     return out
 
 
@@ -572,6 +598,8 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("Choose a video first.")
                 sfx = bool(req.get("strip_sfx", True))
                 target = tidy(load_source(STATE["video"], req["target"]), int(req.get("shift", 0)), sfx)
+                if req.get("join", True):
+                    target = join_split(target)
                 if not target:
                     raise ValueError("No subtitle lines found in that source.")
                 trans = tidy(load_source(STATE["video"], req["trans"]), int(req.get("trans_shift", 0)), sfx) \
@@ -654,7 +682,8 @@ macOS: install Homebrew from brew.sh, then run <code>brew install ffmpeg</code> 
 <details><summary>Timing and clean-up options</summary>
 <div class="row"><label>Shift subtitles by</label><input type="number" id="shift" value="0" step="50"> ms <span class="hint" style="margin:0">(positive = later; use if the text is out of sync with the speech)</span></div>
 <div class="row"><label>Shift translation by</label><input type="number" id="tshift" value="0" step="50"> ms</div>
-<div class="row"><label></label><input type="checkbox" id="sfx" checked><span>Drop sound-effect, speaker and music captions like [door slams], (MUJER) or ♪</span></div></details>
+<div class="row"><label></label><input type="checkbox" id="sfx" checked><span>Drop sound-effect, speaker and music captions like [door slams], (MUJER), and sung lines marked ♪</span></div>
+<div class="row"><label></label><input type="checkbox" id="join" checked><span>Join a sentence that the subtitles split across two or three lines</span></div></details>
 <div class="row"><button class="primary" id="load" disabled>Load subtitle lines</button><span id="loadmsg" class="hint" style="margin:0"></span></div>
 <div class="err" id="err1"></div></section>
 
@@ -724,7 +753,7 @@ $("#video").onchange=e=>setVideo(e.target.value.trim().replace(/^["']|["']$/g,""
 ["target","trans"].forEach(id=>$("#"+id).onchange=e=>{const sel=e.target;if(sel.value=="browse"){sel.value="";browse("subs",S.probe.folder,f=>{S.extra.push(f);const a=$("#target").value,b=$("#trans").value;
   fillSubs($("#target"),"Choose subtitles…");fillSubs($("#trans"),"None");$("#target").value=a;$("#trans").value=b;sel.value="file:"+f;ready()})}ready()});
 $("#load").onclick=async()=>{$("#err1").textContent="";$("#load").disabled=true;$("#loadmsg").textContent="Reading subtitles… (embedded tracks can take a minute)";
-  try{const tr=$("#trans").value;const r=await api("/api/load",{target:$("#target").value,trans:tr&&tr!="browse"?tr:null,shift:+$("#shift").value||0,trans_shift:+$("#tshift").value||0,strip_sfx:$("#sfx").checked});
+  try{const tr=$("#trans").value;const r=await api("/api/load",{target:$("#target").value,trans:tr&&tr!="browse"?tr:null,shift:+$("#shift").value||0,trans_shift:+$("#tshift").value||0,strip_sfx:$("#sfx").checked,join:$("#join").checked});
     S.lines=r.lines.map(l=>Object.assign(l,{on:true}));S.hasTr=S.lines.some(l=>l.trans);$("#filter").value="";render();
     $("#s2").classList.remove("hide");$("#s3").classList.remove("hide");$("#done").classList.add("hide");$("#s2").scrollIntoView({behavior:"smooth"})}
   catch(e){$("#err1").textContent=e.message}$("#loadmsg").textContent="";ready()};
