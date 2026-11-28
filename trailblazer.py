@@ -16,14 +16,14 @@ import unicodedata, webbrowser, zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-APP, VERSION = "PathToFluent Trailblazer", "1.5.0"
+APP, VERSION = "PathToFluent Trailblazer", "1.6.0"
 TOKEN = secrets.token_urlsafe(16)
 MEDIA_EXT = {".mkv", ".mp4", ".m4v", ".avi", ".mov", ".webm", ".ts", ".flv", ".wmv", ".mpg",
              ".mpeg", ".mp3", ".m4a", ".m4b", ".aac", ".flac", ".ogg", ".opus", ".wav"}
 SUB_EXT = {".srt", ".vtt", ".ass", ".ssa"}
 TEXT_SUB_CODECS = {"subrip", "srt", "ass", "ssa", "webvtt", "mov_text", "text"}
 MODEL_ID = 1763738100331          # fixed, so every deck shares one "Trailblazer" note type
-STATE = {"video": None, "probe": None}
+STATE = {"video": None, "probe": None, "season": None}
 JOB = {"state": "idle", "done": 0, "total": 0, "message": "", "path": "", "failures": 0}
 JOB_LOCK = threading.Lock()
 CANCEL = threading.Event()
@@ -68,11 +68,12 @@ def probe(path):
             has_video = True
         elif kind == "audio":
             audio.append({"n": len(audio), "label": label or "Track %d" % (len(audio) + 1),
-                          "codec": s.get("codec_name", "")})
+                          "codec": s.get("codec_name", ""), "lang": tags.get("language", "")})
         elif kind == "subtitle":
             codec = s.get("codec_name", "")
             subs.append({"n": len(subs), "label": label or "Track %d" % (len(subs) + 1),
-                         "codec": codec, "text": codec in TEXT_SUB_CODECS})
+                         "codec": codec, "text": codec in TEXT_SUB_CODECS,
+                         "lang": tags.get("language", "")})
     try:
         duration = float(info.get("format", {}).get("duration") or 0)
     except ValueError:
@@ -252,6 +253,162 @@ def load_source(video, src):
     return parse_srt_vtt(r.stdout.decode("utf-8", "replace"))
 
 
+# ───────────────────────────── whole-folder (season) planning ─────────────────────────────
+# Pure functions: they work on file names and track lists, never on the disk or ffmpeg,
+# so they can be tested on their own (tests/test_season.py). See SPEC.md, rules 1-12, 21-22.
+EPISODE_PATTERNS = [
+    re.compile(r"(?<![a-z0-9])s(\d{1,2})[ ._-]?e(\d{1,3})(?!\d)", re.I),        # S01E03, s1e3, S01.E03
+    re.compile(r"(?<![a-z0-9])(\d{1,2})x(\d{1,3})(?![a-z0-9])", re.I),           # 1x03
+    re.compile(r"(?<![a-z])(?:episode|ep|e)\.?[ ._-]*(\d{1,3})(?!\d)", re.I),    # E03, Ep 3, Episode 3
+]
+LANG_ALIASES = {
+    "es": {"es", "spa", "esp", "spanish", "español", "espanol", "castellano", "castilian"},
+    "fr": {"fr", "fre", "fra", "french", "français", "francais"},
+    "en": {"en", "eng", "english", "inglés", "ingles"},
+    "de": {"de", "ger", "deu", "german", "deutsch"},
+    "it": {"it", "ita", "italian", "italiano"},
+    "pt": {"pt", "por", "portuguese", "português", "portugues"},
+}
+DONE_FILE = "trailblazer_done.json"
+
+
+def episode_key(name):
+    """(season or None, episode) read from a file name, or None. First pattern that matches wins."""
+    stem = os.path.splitext(os.path.basename(name))[0]
+    for i, pat in enumerate(EPISODE_PATTERNS):
+        m = pat.search(stem)
+        if m:
+            return (int(m.group(1)), int(m.group(2))) if i < 2 else (None, int(m.group(1)))
+    return None
+
+
+def same_episode(a, b):
+    if not a or not b or a[1] != b[1]:
+        return False
+    return a[0] is None or b[0] is None or a[0] == b[0]
+
+
+def lang_aliases(lang):
+    lang = (lang or "").lower()
+    return LANG_ALIASES.get(lang, {lang} if lang else set())
+
+
+def _tokens(text):
+    return [t for t in re.split(r"[^\w]+", (text or "").lower()) if t]
+
+
+def known_lang_tokens():
+    return set().union(*LANG_ALIASES.values())
+
+
+def sub_language(sub_name, video_stem=None):
+    """'marked' language tokens in a subtitle file name, from the part after the video's name
+    when it starts with it (so a show called 'Spanish Princess' isn't read as Spanish)."""
+    stem = os.path.splitext(sub_name)[0]
+    if video_stem and stem.lower().startswith(video_stem.lower()):
+        stem = stem[len(video_stem):]
+    return [t for t in _tokens(stem) if t in known_lang_tokens()]
+
+
+def _starts_with_stem(sub_name, video_stem):
+    s, v = sub_name.lower(), video_stem.lower()
+    return s.startswith(v) and (len(s) == len(v) or not s[len(v)].isalnum())
+
+
+def _pick(candidates, lang, video_stem, allow_unmarked):
+    """Rules 8-10: marked files in the language, else (target only) unmarked files, else embedded."""
+    want = lang_aliases(lang)
+    files = sorted(c for c in candidates["files"])
+    marked = [f for f in files if want & set(sub_language(f, video_stem))]
+    unmarked = [f for f in files if not sub_language(f, video_stem)]
+    emb = [t for t in candidates["embedded"] if t.get("text") and (t.get("lang") or "").lower() in want]
+    notes = []
+    if marked:
+        chosen, kind, pool = marked[0], "file", marked
+    elif allow_unmarked and unmarked:
+        chosen, kind, pool = unmarked[0], "file", unmarked
+        notes.append("language not marked in file name")
+    elif emb:
+        chosen, kind, pool = emb[0], "embedded", emb
+    else:
+        return None, notes
+    if len(pool) > 1:
+        notes.append("%d found" % len(pool))
+    if kind == "file":
+        return {"kind": "file", "name": chosen, "src": "file:" + chosen}, notes
+    return {"kind": "embedded", "name": "Embedded track %d" % (chosen["n"] + 1), "src": "emb:%d" % chosen["n"]}, notes
+
+
+def built_on(record, deck, label):
+    """Date the episode was last built into this deck, from trailblazer_done.json's contents."""
+    for e in (record or {}).get("built", []):
+        if e.get("episode") == label and e.get("deck") == deck:
+            return e.get("date")
+    return None
+
+
+def record_built(record, deck, built, date):
+    """Return a new record with `built` ([(label, cards), ...]) added for `deck` on `date`."""
+    rows = [e for e in (record or {}).get("built", [])
+            if not (e.get("deck") == deck and e.get("episode") in {b[0] for b in built})]
+    rows += [{"episode": label, "deck": deck, "cards": cards, "date": date} for label, cards in built]
+    rows.sort(key=lambda e: (e["deck"].lower(), e["episode"].lower()))
+    return {"version": 1, "built": rows}
+
+
+def plan_season(files, embedded, target, trans, record=None, deck=""):
+    """Rows for the pairing list.
+    files:    names of the files in the season folder (no paths)
+    embedded: {video name: [{"n", "lang", "text"}, ...]} text and image subtitle tracks per video
+    target / trans: language codes ("es", "en"); trans may be "" for none
+    record:   contents of trailblazer_done.json, or None"""
+    videos = sorted((f for f in files if os.path.splitext(f)[1].lower() in MEDIA_EXT), key=str.lower)
+    subs = sorted((f for f in files if os.path.splitext(f)[1].lower() in SUB_EXT), key=str.lower)
+    stems = {v: os.path.splitext(v)[0] for v in videos}
+    keys = {v: episode_key(v) for v in videos}
+    cands = {v: {"files": [], "embedded": embedded.get(v, [])} for v in videos}
+    for s in subs:                                            # rule 6: by name first ...
+        owners = [v for v in videos if _starts_with_stem(s, stems[v])]
+        if not owners:                                        # ... then by episode number
+            k = episode_key(s)
+            owners = [v for v in videos if k and same_episode(keys[v], k)]
+        if owners:
+            best = max(owners, key=lambda v: len(stems[v]))   # the longest matching name wins
+            cands[best]["files"].append(s)
+    counts = {}
+    for v in videos:
+        if keys[v]:
+            counts[keys[v]] = counts.get(keys[v], 0) + 1
+    rows = []
+    for v in videos:
+        stem, key, notes = stems[v], keys[v], []
+        tgt, n1 = _pick(cands[v], target, stem, allow_unmarked=True)
+        tr, n2 = _pick(cands[v], trans, stem, allow_unmarked=False) if trans else (None, [])
+        if tr and tgt and tr["src"] == tgt["src"]:
+            tr = None
+        notes += n1 + ["translation: " + n for n in n2]
+        ticked = True
+        if key is None:
+            notes.insert(0, "no episode number")
+            ticked = False
+        elif counts[key] > 1:
+            notes.insert(0, "duplicate episode")
+            ticked = False
+        if tgt is None:
+            notes.insert(0, "no subtitles")
+            ticked = False
+        date = built_on(record, deck, stem)
+        if date:
+            notes.insert(0, "built on %s" % date)
+            ticked = False
+        label = ("S%02dE%02d" % key if key[0] is not None else "E%02d" % key[1]) if key else ""
+        rows.append({"video": v, "episode": stem, "number": label, "key": key,
+                     "target": tgt, "trans": tr, "notes": notes, "ticked": ticked})
+    rows.sort(key=lambda r: (r["key"] is None, r["key"][0] or 0 if r["key"] else 0,
+                             r["key"][1] if r["key"] else 0, r["video"].lower()))
+    return rows
+
+
 # ───────────────────────────── Anki package writer ─────────────────────────────
 CARD_CSS = """.card{font-family:-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;font-size:22px;
 text-align:center;color:#1c1c1e;background:#fafafa;margin:0;padding:16px}
@@ -409,76 +566,228 @@ def set_job(**kw):
         JOB.update(kw)
 
 
+def cut_episode(video, pr, lines, deck, episode, opts, work):
+    """Cut the clips and snapshots for one episode's lines and build its notes.
+    Returns (notes, media), or None if cancelled. Progress goes to JOB["done"] and JOB["failures"]."""
+    slug = slugify(deck + "_" + episode, episode)
+    want_audio = bool(opts.get("audio", True)) and bool(pr["audio"])
+    want_shot = bool(opts.get("snapshot", True)) and pr["has_video"]
+    pad_b, pad_a = int(opts.get("pad_before", 0)), int(opts.get("pad_after", 400))
+    width, bitrate = int(opts.get("width", 480)), int(opts.get("bitrate", 96))
+    track = int(opts.get("track", 0))
+    dur_ms = pr["duration"] * 1000 if pr["duration"] else None
+    fails = [0]
+
+    def make(ln):
+        if CANCEL.is_set():
+            return None
+        seq = stamp(ln["start"])
+        base = "trailblazer_%s_%s" % (slug, seq)
+        audio = shot = ""
+        if want_audio:
+            st, en = clip_span(ln["start"], ln["end"], pad_b, pad_a)
+            if dur_ms:
+                en = min(en, dur_ms)
+            name = base + ".mp3"
+            r = run(clip_cmd(video, st, en, track, bitrate, os.path.join(work, name)))
+            if r.returncode == 0 and os.path.getsize(os.path.join(work, name)) > 0:
+                audio = name
+        if want_shot:
+            name = base + ".jpg"
+            r = run(shot_cmd(video, (ln["start"] + ln["end"]) / 2, width, os.path.join(work, name)))
+            if r.returncode == 0 and os.path.exists(os.path.join(work, name)):
+                shot = name
+        failed = (want_audio and not audio) or (want_shot and not shot)
+        with JOB_LOCK:
+            JOB["done"] += 1
+            JOB["failures"] += 1 if failed else 0
+        return {"seq": seq, "audio": audio, "shot": shot}
+
+    workers = max(1, min(4, os.cpu_count() or 2))
+    with concurrent.futures.ThreadPoolExecutor(workers) as pool:
+        results = list(pool.map(make, lines))
+    if CANCEL.is_set():
+        return None
+    notes, media = [], []
+    for ln, res in zip(lines, results):
+        media += [m for m in (res["audio"], res["shot"]) if m]
+        seq = "%s_%s" % (episode, res["seq"])
+        guid = base64.urlsafe_b64encode(hashlib.sha1(("%s|%s|%d" % (deck, episode, ln["start"]))
+                                                     .encode("utf-8")).digest()[:9]).decode()
+        notes.append({"guid": guid, "tags": ["Trailblazer", slugify(episode, "episode")],
+                      "fields": [html.escape(seq), html.escape(ln["text"]), html.escape(ln.get("trans") or ""),
+                                 "[sound:%s]" % res["audio"] if res["audio"] else "",
+                                 '<img src="%s">' % res["shot"] if res["shot"] else "",
+                                 html.escape("%s · %s" % (episode, res["seq"].rsplit(".", 1)[0].replace(".", ":"))),
+                                 ""] + [""] * 6})
+    return notes, media
+
+
+def writable_dir(path):
+    path = os.path.expanduser(path or "")
+    if path and os.path.isdir(path) and os.access(path, os.W_OK):
+        return path
+    fallback = os.path.join(os.path.expanduser("~"), "Downloads")
+    os.makedirs(fallback, exist_ok=True)
+    return fallback
+
+
+def deck_filename(deck, episode=None):
+    name = deck.replace("::", " - ") if episode is None or deck == episode \
+        else "%s - %s" % (deck.replace("::", " - "), episode)
+    return re.sub(r'[\\/:*?"<>|]+', "-", name).strip() + ".apkg"
+
+
 def generate(req):
     video, pr = STATE["video"], STATE["probe"]
     work = tempfile.mkdtemp(prefix="trailblazer_media_")
     try:
         deck = (req.get("deck") or pr["stem"]).strip()
         episode = (req.get("episode") or pr["stem"]).strip()
-        slug = slugify(deck + "_" + episode, episode)
-        want_audio = bool(req.get("audio", True)) and bool(pr["audio"])
-        want_shot = bool(req.get("snapshot", True)) and pr["has_video"]
-        pad_b, pad_a = int(req.get("pad_before", 0)), int(req.get("pad_after", 400))
-        width, bitrate = int(req.get("width", 480)), int(req.get("bitrate", 96))
-        track, lines = int(req.get("track", 0)), req["lines"]
-        dur_ms = pr["duration"] * 1000 if pr["duration"] else None
+        lines = req["lines"]
         set_job(state="running", done=0, total=len(lines), message="Cutting clips…", path="", failures=0)
-
-        def make(ln):
-            if CANCEL.is_set():
-                return None
-            seq = stamp(ln["start"])
-            base = "trailblazer_%s_%s" % (slug, seq)
-            audio = shot = ""
-            if want_audio:
-                st, en = clip_span(ln["start"], ln["end"], pad_b, pad_a)
-                if dur_ms:
-                    en = min(en, dur_ms)
-                name = base + ".mp3"
-                r = run(clip_cmd(video, st, en, track, bitrate, os.path.join(work, name)))
-                if r.returncode == 0 and os.path.getsize(os.path.join(work, name)) > 0:
-                    audio = name
-            if want_shot:
-                name = base + ".jpg"
-                r = run(shot_cmd(video, (ln["start"] + ln["end"]) / 2, width, os.path.join(work, name)))
-                if r.returncode == 0 and os.path.exists(os.path.join(work, name)):
-                    shot = name
-            failed = (want_audio and not audio) or (want_shot and not shot)
-            with JOB_LOCK:
-                JOB["done"] += 1
-                JOB["failures"] += 1 if failed else 0
-            return {"seq": seq, "audio": audio, "shot": shot}
-
-        workers = max(1, min(4, os.cpu_count() or 2))
-        with concurrent.futures.ThreadPoolExecutor(workers) as pool:
-            results = list(pool.map(make, lines))
-        if CANCEL.is_set():
+        built = cut_episode(video, pr, lines, deck, episode, req, work)
+        if built is None:
             set_job(state="cancelled", message="Cancelled.")
             return
+        notes, media = built
         set_job(message="Packing the deck…")
-        notes, media = [], []
-        for ln, res in zip(lines, results):
-            media += [m for m in (res["audio"], res["shot"]) if m]
-            seq = "%s_%s" % (episode, res["seq"])
-            guid = base64.urlsafe_b64encode(hashlib.sha1(("%s|%s|%d" % (deck, episode, ln["start"]))
-                                                         .encode("utf-8")).digest()[:9]).decode()
-            notes.append({"guid": guid, "tags": ["Trailblazer", slugify(episode, "episode")],
-                          "fields": [html.escape(seq), html.escape(ln["text"]), html.escape(ln.get("trans") or ""),
-                                     "[sound:%s]" % res["audio"] if res["audio"] else "",
-                                     '<img src="%s">' % res["shot"] if res["shot"] else "",
-                                     html.escape("%s · %s" % (episode, res["seq"].rsplit(".", 1)[0].replace(".", ":"))),
-                                     ""] + [""] * 6})
-        outdir = os.path.expanduser(req.get("outdir") or pr["folder"])
-        if not (os.path.isdir(outdir) and os.access(outdir, os.W_OK)):
-            outdir = os.path.join(os.path.expanduser("~"), "Downloads")
-            os.makedirs(outdir, exist_ok=True)
-        fname = re.sub(r'[\\/:*?"<>|]+', "-", deck.replace("::", " - ") if deck == episode
-                       else "%s - %s" % (deck.replace("::", " - "), episode)).strip() + ".apkg"
-        out = os.path.join(outdir, fname)
+        out = os.path.join(writable_dir(req.get("outdir") or pr["folder"]), deck_filename(deck, episode))
         write_apkg(out, deck, notes, work, media)
         set_job(state="done", path=out, message="%d cards written." % len(notes))
     except Exception as e:                                # surfaced in the interface
         set_job(state="error", message=str(e) or e.__class__.__name__)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+# ───────────────────────────── whole folder (season) ─────────────────────────────
+def pick_audio_track(pr, lang):
+    """The first audio track tagged with the language being learned, else the first track."""
+    want = lang_aliases(lang)
+    for a in pr["audio"]:
+        if (a.get("lang") or "").lower() in want:
+            return a["n"]
+    return 0
+
+
+def season_lines(folder, video, row, opts):
+    """Subtitle lines for one episode, cleaned, joined and paired with the translation."""
+    path = os.path.join(folder, video)
+    src = lambda s: "file:" + os.path.join(folder, s[5:]) if s.startswith("file:") else s
+    sfx = bool(opts.get("strip_sfx", True))
+    target = tidy(load_source(path, src(row["target"]["src"])), int(opts.get("shift", 0)), sfx)
+    if opts.get("join", True):
+        target = join_split(target)
+    trans = tidy(load_source(path, src(row["trans"]["src"])), int(opts.get("trans_shift", 0)), sfx) \
+        if row.get("trans") else []
+    return pair(target, trans)
+
+
+def read_record(folder):
+    try:
+        with open(os.path.join(folder, DONE_FILE), encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def scan_season(req):
+    """The pairing list for a folder (SPEC.md section 2, step 4)."""
+    folder = os.path.abspath(os.path.expanduser(req.get("folder") or ""))
+    if not os.path.isdir(folder):
+        raise ValueError("That folder doesn't exist.")
+    files = [f for f in sorted(os.listdir(folder))
+             if not f.startswith(".") and os.path.isfile(os.path.join(folder, f))]
+    probes, embedded = {}, {}
+    for f in files:
+        if os.path.splitext(f)[1].lower() in MEDIA_EXT:
+            try:
+                probes[f] = probe(os.path.join(folder, f))
+            except ValueError:
+                probes[f] = None
+            embedded[f] = probes[f]["subs"] if probes[f] else []
+    deck = (req.get("deck") or os.path.basename(folder)).strip()
+    target, trans = req.get("target") or "es", req.get("trans") or ""
+    rows = plan_season(files, embedded, target, trans, read_record(folder), deck)
+    for r in rows:
+        pr = probes.get(r["video"])
+        r["lines"] = None
+        if pr is None:
+            r["notes"].insert(0, "ffmpeg can't read this file")
+            r["ticked"] = False
+            continue
+        r["audio"] = pick_audio_track(pr, target)
+        if len(pr["audio"]) > 1:
+            r["notes"].append("audio: " + pr["audio"][r["audio"]]["label"])
+        if r["target"] and r["target"]["kind"] == "file":     # embedded tracks are counted when built
+            try:
+                r["lines"] = len(season_lines(folder, r["video"], r, req))
+            except Exception:
+                r["lines"] = 0
+            if not r["lines"]:
+                r["notes"].insert(0, "no subtitle lines found")
+                r["ticked"] = False
+    STATE["season"] = {"folder": folder, "probes": probes,
+                       "rows": {r["video"]: r for r in rows}}
+    return {"folder": folder, "deck": deck, "rows": rows}
+
+
+def generate_season(req):
+    season = STATE["season"]
+    folder, probes = season["folder"], season["probes"]
+    deck = (req.get("deck") or os.path.basename(folder)).strip()
+    work = tempfile.mkdtemp(prefix="trailblazer_media_")
+    failed, built, all_notes, all_media = [], [], [], []
+    try:
+        set_job(state="running", done=0, total=0, message="Reading subtitles…", path="", failures=0,
+                failed=[], record="")
+        jobs = []
+        for video in req["episodes"]:
+            row = season["rows"].get(video)
+            try:
+                if not row or not row["target"]:
+                    raise ValueError("no subtitles")
+                lines = season_lines(folder, video, row, req)
+                if not lines:
+                    raise ValueError("no subtitle lines found")
+                jobs.append((row, lines))
+            except Exception as e:
+                failed.append({"episode": row["episode"] if row else video, "reason": str(e) or e.__class__.__name__})
+        set_job(total=sum(len(l) for _, l in jobs), failed=failed)
+        for i, (row, lines) in enumerate(jobs, 1):
+            set_job(message="Episode %d of %d (%s): cutting clips…" % (i, len(jobs), row["episode"]))
+            try:
+                opts = dict(req, track=row.get("audio", 0))
+                res = cut_episode(os.path.join(folder, row["video"]), probes[row["video"]], lines,
+                                  deck, row["episode"], opts, work)
+            except Exception as e:
+                failed.append({"episode": row["episode"], "reason": str(e) or e.__class__.__name__})
+                with JOB_LOCK:
+                    JOB["done"] += len(lines)
+                continue
+            if res is None:
+                set_job(state="cancelled", message="Cancelled. No deck was written.")
+                return
+            all_notes += res[0]
+            all_media += res[1]
+            built.append((row["episode"], len(res[0])))
+        if not built:
+            set_job(state="error", message="No episode could be built.", failed=failed)
+            return
+        set_job(message="Packing the deck…", failed=failed)
+        out = os.path.join(writable_dir(req.get("outdir") or folder), deck_filename(deck))
+        write_apkg(out, deck, all_notes, work, all_media)
+        rec_dir = folder if os.access(folder, os.W_OK) else os.path.dirname(out)
+        rec_path = os.path.join(rec_dir, DONE_FILE)
+        record = record_built(read_record(rec_dir), deck, built, time.strftime("%Y-%m-%d"))
+        with open(rec_path, "w", encoding="utf-8") as f:
+            json.dump(record, f, ensure_ascii=False, indent=1)
+        set_job(state="done", path=out, record=rec_path, failed=failed,
+                message="%d cards from %d episode%s written." % (len(all_notes), len(built),
+                                                                 "" if len(built) == 1 else "s"))
+    except Exception as e:
+        set_job(state="error", message=str(e) or e.__class__.__name__, failed=failed)
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
@@ -614,6 +923,22 @@ class Handler(BaseHTTPRequestHandler):
                 set_job(state="running", done=0, total=len(req["lines"]), message="Starting…", path="", failures=0)
                 threading.Thread(target=generate, args=(req,), daemon=True).start()
                 return self._send(200, {"ok": True})
+            if u.path == "/api/season/scan":
+                if JOB["state"] == "running":
+                    raise ValueError("A deck is being created. Wait for it to finish.")
+                return self._send(200, scan_season(req))
+            if u.path == "/api/season/generate":
+                if JOB["state"] == "running":
+                    raise ValueError("A deck is already being created.")
+                if not STATE["season"]:
+                    raise ValueError("Find the episodes first.")
+                if not req.get("episodes"):
+                    raise ValueError("No episodes ticked.")
+                CANCEL.clear()
+                set_job(state="running", done=0, total=0, message="Starting…", path="", failures=0,
+                        failed=[], record="")
+                threading.Thread(target=generate_season, args=(req,), daemon=True).start()
+                return self._send(200, {"ok": True})
             if u.path == "/api/cancel":
                 CANCEL.set()
                 return self._send(200, {"ok": True})
@@ -668,11 +993,42 @@ dialog::backdrop{background:#0006}.dlg{padding:18px 20px}.places{display:flex;ga
 .list{height:340px;overflow:auto;border:1px solid var(--line);border-radius:10px;margin:10px 0}
 .list div{padding:7px 12px;cursor:pointer;border-bottom:1px solid var(--line);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .list div:hover{background:var(--acc2)}.list .d{font-weight:500}.list .e{color:var(--mute);cursor:default}
+.mode{display:flex;gap:0;margin:0 0 18px}.mode button{border-radius:0;padding:8px 18px}.mode button:first-child{border-radius:8px 0 0 8px}
+.mode button:last-child{border-radius:0 8px 8px 0;margin-left:-1px}.mode button.on{background:var(--acc);border-color:var(--acc);color:var(--card);font-weight:600}
+td.note{font-size:12px;color:var(--mute)}td.num{white-space:nowrap;font-variant-numeric:tabular-nums}.fail{margin:6px 0 0 18px;padding:0;font-size:13px}
 </style></head><body>
 <header><h1>PathToFluent Trailblazer</h1><span>Video + subtitles → Anki cards</span><button id="quit">Quit</button></header>
 <main>
 <section id="noff" class="hide"><h2>ffmpeg is needed</h2><p class="hint">Trailblazer uses the free tool ffmpeg to cut audio and grab snapshots, and it isn't installed yet.<br>
 macOS: install Homebrew from brew.sh, then run <code>brew install ffmpeg</code> in Terminal. Windows: <code>winget install ffmpeg</code>. Linux: install <code>ffmpeg</code> with your package manager. Then restart Trailblazer.</p></section>
+
+<div class="mode"><button id="m1" class="on">One episode</button><button id="m2">Whole folder</button></div>
+
+<section id="f1" class="hide"><h2><b>1</b>Choose the season's folder</h2><p class="hint">Every video in the folder becomes an episode, paired with its subtitles. Sub-folders aren't searched.</p>
+<div class="row"><label>Folder</label><input type="text" id="folder" placeholder="Click Browse, or paste a full path" spellcheck="false"><button id="bfolder">Browse…</button></div>
+<div class="row"><label>Language you're learning</label><select id="flang" style="flex:0"></select></div>
+<div class="row"><label>Translation (optional)</label><select id="ftrans" style="flex:0"></select></div>
+<div class="row"><label>Deck name</label><input type="text" id="fdeck" placeholder="The folder's name"><span class="hint" style="margin:0">One deck for the whole show</span></div>
+<details><summary>Timing, clean-up, audio and image options (used for every episode)</summary>
+<div class="row"><label>Shift subtitles by</label><input type="number" id="fshift" value="0" step="50"> ms</div>
+<div class="row"><label>Shift translation by</label><input type="number" id="ftshift" value="0" step="50"> ms</div>
+<div class="row"><label></label><input type="checkbox" id="fsfx" checked><span>Drop sound-effect, speaker and music captions, and sung lines marked ♪</span></div>
+<div class="row"><label></label><input type="checkbox" id="fjoin" checked><span>Join a sentence that the subtitles split across two or three lines</span></div>
+<div class="row"><label>Extra audio before / after</label><input type="number" id="fpadb" value="0" step="50"> / <input type="number" id="fpada" value="400" step="50"> ms</div>
+<div class="row"><label>Include</label><input type="checkbox" id="fwaudio" checked><span>Audio clip</span>&nbsp;&nbsp;<input type="checkbox" id="fwshot" checked><span>Snapshot</span></div>
+<div class="row"><label>Audio quality</label><select id="fbitrate" style="flex:0"><option value="64">Small (64 kbps)</option><option value="96" selected>Normal (96 kbps)</option><option value="128">High (128 kbps)</option></select></div>
+<div class="row"><label>Snapshot width</label><input type="number" id="fwidth" value="480" min="160" max="1920" step="40"> px</div></details>
+<div class="row"><button class="primary" id="fscan" disabled>Find episodes</button><span id="fscanmsg" class="hint" style="margin:0"></span></div>
+<div class="err" id="ferr1"></div></section>
+
+<section id="f2" class="hide"><h2><b>2</b>Check the episodes</h2><p class="hint">Check each video is paired with the right subtitles. Untick any episode you don't want. Episodes already built, or with something missing, start unticked.</p>
+<div class="bar"><button id="fall">Select all</button><button id="fnone">Select none</button><span class="count" id="fcount"></span></div>
+<div class="tablewrap"><table><thead><tr><th></th><th>Episode</th><th>Video</th><th>Subtitles</th><th>Translation</th><th>Lines</th><th>Notes</th></tr></thead><tbody id="frows"></tbody></table></div>
+<div class="row" style="margin-top:14px"><button class="primary" id="fgo">Create season deck</button><button id="fcancel" class="hide">Cancel</button></div>
+<div id="fprog" class="hide"><progress id="fpbar" value="0" max="1"></progress><p class="hint" id="fpmsg"></p></div>
+<div class="err" id="ferr2"></div>
+<div class="done hide" id="fdone"><b id="fdonemsg"></b><div class="path" id="fdonepath"></div><div class="path" id="frecpath"></div>
+<div id="ffailed"></div><div class="row"><button id="freveal">Show in folder</button><button id="fdl">Download a copy</button></div></div></section>
 
 <section id="s1"><h2><b>1</b>Choose your files</h2><p class="hint">Pick an episode or film, then the subtitles in the language you're learning.</p>
 <div class="row"><label>Video or audio file</label><input type="text" id="video" placeholder="Click Browse, or paste a full path" spellcheck="false"><button id="bvideo">Browse…</button></div>
@@ -797,6 +1153,62 @@ $("#cancel").onclick=()=>api("/api/cancel",{x:1});
 $("#reveal").onclick=()=>api("/api/reveal",{x:1}).catch(()=>{});
 $("#dl").onclick=()=>{location.href="/api/download?t="+T};
 $("#quit").onclick=async()=>{if(!confirm("Quit Trailblazer?"))return;await api("/api/quit",{x:1}).catch(()=>{});document.body.innerHTML='<p style="padding:40px">Trailblazer has stopped. You can close this tab.</p>'};
+// ── whole folder ──
+const LANGS=[["es","Spanish"],["fr","French"],["en","English"],["de","German"],["it","Italian"],["pt","Portuguese"]];
+const store=(k,v)=>{try{if(v===undefined)return localStorage.getItem(k);localStorage.setItem(k,v)}catch(e){return null}};
+$("#flang").innerHTML=LANGS.map(([c,n])=>`<option value="${c}">${n}</option>`).join("");
+$("#ftrans").innerHTML='<option value="">None</option>'+LANGS.map(([c,n])=>`<option value="${c}">${n}</option>`).join("");
+$("#flang").value=store("tbLang")||"es";$("#ftrans").value=store("tbTrans")??"en";
+function setMode(m){const f=m=="folder";$("#m1").classList.toggle("on",!f);$("#m2").classList.toggle("on",f);
+  ["s1"].forEach(id=>$("#"+id).classList.toggle("hide",f));$("#f1").classList.toggle("hide",!f);
+  if(f){$("#s2").classList.add("hide");$("#s3").classList.add("hide")}else{$("#f2").classList.add("hide")}store("tbMode",m)}
+$("#m1").onclick=()=>setMode("episode");$("#m2").onclick=()=>setMode("folder");
+const fready=()=>{$("#fscan").disabled=!$("#folder").value.trim()};
+$("#folder").oninput=fready;
+$("#bfolder").onclick=()=>browse("dir",$("#folder").value||store("sdDir")||"",p=>{$("#folder").value=p;fready();if(!$("#fdeck").value)$("#fdeck").value=base(p);scan()});
+["flang","ftrans"].forEach(id=>$("#"+id).onchange=()=>{store("tbLang",$("#flang").value);store("tbTrans",$("#ftrans").value);if(S.season)scan()});
+$("#fdeck").onchange=()=>{if(S.season)scan()};
+const fopts=()=>({folder:$("#folder").value.trim().replace(/^["']|["']$/g,""),deck:$("#fdeck").value.trim(),target:$("#flang").value,trans:$("#ftrans").value,
+  shift:+$("#fshift").value||0,trans_shift:+$("#ftshift").value||0,strip_sfx:$("#fsfx").checked,join:$("#fjoin").checked});
+async function scan(){$("#ferr1").textContent="";$("#fscan").disabled=true;$("#fscanmsg").textContent="Looking through the folder…";
+  try{const r=await api("/api/season/scan",fopts());S.season=r;$("#folder").value=r.folder;if(!$("#fdeck").value)$("#fdeck").value=r.deck;frender();
+    $("#f2").classList.remove("hide");$("#fdone").classList.add("hide");$("#ferr2").textContent=""}
+  catch(e){$("#ferr1").textContent=e.message}$("#fscanmsg").textContent="";fready()}
+$("#fscan").onclick=scan;
+function frender(){const rows=S.season.rows,tb=$("#frows");tb.innerHTML="";
+  if(!rows.length){tb.innerHTML='<tr><td colspan="7" class="note">No video or audio files in this folder.</td></tr>'}
+  rows.forEach((r,i)=>{const tr=document.createElement("tr");tr.dataset.i=i;if(!r.ticked)tr.className="off";
+    tr.innerHTML=`<td><input type="checkbox" ${r.ticked?"checked":""} ${r.target?"":"disabled"}></td><td class="num">${esc(r.number||"–")}</td><td>${esc(r.video)}</td>`+
+      `<td>${r.target?esc(r.target.name):"–"}</td><td>${r.trans?esc(r.trans.name):"–"}</td><td class="num">${r.lines==null?(r.target?"later":"–"):r.lines}</td><td class="note">${esc(r.notes.join("; "))}</td>`;
+    tb.appendChild(tr)});fcount()}
+function fcount(){const rows=S.season.rows,on=rows.filter(r=>r.ticked),n=on.reduce((a,r)=>a+(r.lines||0),0);
+  $("#fcount").textContent=`${on.length} of ${rows.length} episodes ticked`+(n?` · about ${n} cards`:"");$("#fgo").disabled=!on.length}
+$("#frows").addEventListener("click",e=>{if(e.target.type!="checkbox")return;const tr=e.target.closest("tr"),r=S.season.rows[+tr.dataset.i];
+  r.ticked=e.target.checked;tr.className=r.ticked?"":"off";fcount()});
+const fsetAll=on=>{S.season.rows.forEach(r=>{if(r.target)r.ticked=on});frender()};
+$("#fall").onclick=()=>fsetAll(true);$("#fnone").onclick=()=>fsetAll(false);
+$("#fgo").onclick=async()=>{$("#ferr2").textContent="";$("#fdone").classList.add("hide");
+  const episodes=S.season.rows.filter(r=>r.ticked).map(r=>r.video);
+  try{await api("/api/season/generate",Object.assign(fopts(),{episodes,outdir:S.season.folder,audio:$("#fwaudio").checked,snapshot:$("#fwshot").checked,
+    pad_before:+$("#fpadb").value||0,pad_after:+$("#fpada").value||0,bitrate:+$("#fbitrate").value,width:+$("#fwidth").value||480}))}
+  catch(e){$("#ferr2").textContent=e.message;return}
+  $("#fgo").disabled=true;$("#fscan").disabled=true;$("#fcancel").classList.remove("hide");$("#fprog").classList.remove("hide");fpoll()};
+async function fpoll(){let j;try{j=await api("/api/job")}catch(e){setTimeout(fpoll,1000);return}
+  $("#fpbar").max=j.total||1;$("#fpbar").value=j.done;$("#fpmsg").textContent=j.state=="running"?`${j.message} ${j.total?j.done+" of "+j.total+" lines":""}`:j.message;
+  if(j.state=="running"){setTimeout(fpoll,700);return}
+  $("#fgo").disabled=false;$("#fcancel").classList.add("hide");$("#fprog").classList.add("hide");fready();
+  const fl=(j.failed||[]).map(f=>`<li>${esc(f.episode)}: ${esc(f.reason)}</li>`).join("");
+  if(j.state=="error"){$("#ferr2").innerHTML=esc("Couldn't create the deck: "+j.message)+(fl?`<ul class="fail">${fl}</ul>`:"")}
+  if(j.state=="cancelled")$("#ferr2").textContent=j.message;
+  if(j.state=="done"){$("#fdonemsg").textContent="Season deck ready — "+j.message+(j.failures?` (${j.failures} lines are missing audio or a snapshot.)`:"");
+    $("#fdonepath").textContent=j.path;$("#frecpath").textContent="Built episodes recorded in "+j.record;
+    $("#ffailed").innerHTML=fl?`<p class="hint" style="margin:10px 0 0">Left out:</p><ul class="fail">${fl}</ul>`:"";$("#fdone").classList.remove("hide");
+    await scan();$("#fdone").classList.remove("hide")}}
+$("#fcancel").onclick=()=>api("/api/cancel",{x:1});
+$("#freveal").onclick=()=>api("/api/reveal",{x:1}).catch(()=>{});
+$("#fdl").onclick=()=>{location.href="/api/download?t="+T};
+if(store("tbMode")=="folder")setMode("folder");
+
 api("/api/status").then(s=>{if(!s.ffmpeg){$("#noff").classList.remove("hide");$("#s1").classList.add("hide")}});
 </script></body></html>"""
 

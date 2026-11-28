@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.6.0 (2026-11-28)
+- New: **Whole folder** mode. Point Trailblazer at a season's folder and it pairs every video with its subtitles and translation, by file name or episode number (`S01E03`, `1x03`, `Episode 3`), using subtitle files beside the videos or text tracks inside them. Check the list, untick what you don't want, and get one deck file for the whole season.
+- Episodes already built are recorded in `trailblazer_done.json` in the season's folder and start unticked next time. Tick one to build it again.
+- An episode that fails is left out and named on the end screen; the rest are still built.
+- When a video has several audio tracks, the one tagged with the language you're learning is used.
+- Clean-up, joining, timing and audio options are set once for the whole season. There is no line-by-line review in this mode; use One episode for that.
+- Cards are labelled with the video's file name, as in One episode mode, so an episode built earlier on its own is updated rather than duplicated when built again into the same deck.
+
 ## 1.5.0 (2026-11-28)
 - A sung line marked with ♪ is now dropped whole. Before, only the note signs were removed and the lyric stayed as a card. Part of the existing clean-up option.
 - New option, on by default: a sentence the subtitles split across two or three lines becomes one card with one clip. Lines are joined only when the earlier one stops without closing punctuation, the next starts in lower case, the pause is under a second and the whole is under twelve seconds. Dialogue lines starting with a dash are left alone.
@@ -27,3 +35,7 @@
 
 ## 1.0 (2026-11-21)
 - First version.
+
+## Known gaps
+- A card's identity includes its deck name. An episode built into one deck and later into another is imported as new cards, not updated. Untick episodes already in Anki under another deck when building a season.
+- Cancel during a whole-folder build, and a season folder that can't be written to, are untested.

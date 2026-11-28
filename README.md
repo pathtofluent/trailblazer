@@ -22,7 +22,17 @@ Needs Python 3.8 or newer and ffmpeg (`brew install ffmpeg` on macOS, `winget in
 
 Speaker and sound captions such as [door slams] or (MUJER) are removed from the cards unless you turn that option off, and so are sung lines marked ♪. A sentence split across two or three subtitle lines is joined into one card; that is a separate option.
 
-Reads .srt, .vtt and .ass subtitles. Image-based subtitles (most DVD and Blu-ray tracks) can't be read. One episode at a time.
+Reads .srt, .vtt and .ass subtitles. Image-based subtitles (most DVD and Blu-ray tracks) can't be read.
+
+## A whole season at once
+
+Choose **Whole folder** at the top and pick the season's folder.
+
+1. Pick the language you're learning and, optionally, the translation language.
+2. Trailblazer lists every video in the folder with the subtitles it paired it with: files beside the video that share its name or episode number (`S01E03`, `1x03`, `Episode 3`), or text tracks inside it. Rows with nothing to build, such as missing subtitles or no episode number, start unticked, with the reason shown.
+3. Untick anything you don't want and press **Create season deck**. You get one `.apkg` file for the whole season, in one deck.
+
+The options are set once for every episode, and there is no line-by-line review in this mode. Episodes already built are noted in `trailblazer_done.json` in the folder and start unticked next time. If a video has several audio tracks, the one in the language you're learning is used. Sub-folders aren't searched.
 
 Importing the same episode again updates its cards instead of duplicating them.
 
